@@ -1,0 +1,354 @@
+---
+title: "ML_Models"
+author: "Mohamed Ba-Aoum"
+date: "2023-11-05"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+#install.packages("caret")
+library(caret)
+library(naniar)
+library(psych)
+library(pROC)
+library(glmnet)
+```
+
+# Data from regression model 
+```{r}
+ED_data <- read.csv("ML_Data2.csv")
+
+# to remove X
+ED_data <- ED_data |> 
+  select(-1)
+```
+
+# Data Precheck 
+```{r}
+summary(ED_data)
+
+# Remove weekends 
+ED_data <- ED_data %>%
+  filter(Arrival.Day != "Sun" & Arrival.Day != "Sat")
+
+# Eliminate direct admit 
+ED_data <- ED_data |> 
+  filter(ESILevel != "Direct Admit")
+
+# Note: the current data is as the regression  paper 
+```
+
+# Chnage variable names 
+```{r}
+ED_data <- ED_data |> 
+  rename(
+    LOS = LOSfselcted,
+    Month = Month, 
+    A.Day = Arrival.Day,
+    A.Hr = Arrival_Hr_Rd, 
+    A.shift = Arrival.Shift..1st..12.AM., 
+    W.FP = Waiting.for.1st.provider_Rd, # waiting for provider and it is correlated with LOS
+    ESI = ESILevel, 
+    sex = Gender,
+    Age.Group = Age.Group,
+    EDLevel = EDLevel, 
+    Pat_count = Pat_OrderCount_Total, # not clear what is this and it removed from regression 
+    D.type = DispoType, # discharge type 
+    T.arrive = TransportArrive, #arrival mode 
+    PP_MD = PatientsPerMD_Mean_Rd, #patient per md mean
+    PP_N = PatientsPerNURSE_Mean_Rd,
+    PP_R = PatientsPerPA_RESIDENT_Mean,
+    FirstWard = FirstWard, # onlyfirst ward and it removed from regression 
+    W.Change = Ward.Change                 # change from a ward to a ward 
+  )
+
+```
+
+# Split the outcoem variabe: less than and greater than 4 hours 
+```{r}
+# Assuming your data frame is named df
+ED_data <- ED_data |> 
+  mutate(LOS_binary = if_else(LOS > 4, 1, 0))
+# If LOS is greater than 4, it sets LOS_binary to 1 for that row.
+# If LOS is 4 or less, it sets LOS_binary to 0 for that row.
+
+ED_data |> 
+  count(LOS_binary)
+
+# check if missing any 
+#gg_miss_var(ED_data)
+#sum(is.na(ED_data))
+```
+
+# Adjust outcome variabele and IVs 
+```{r}
+levels(ED_data$LOS)
+prop.table(table(ED_data$LOS_binary)) # 0= less than 4 hrs = 0.54% vs. 1= 0.45% greater than 4 hrs
+#         0         1 
+# 0.5453582 0.4546418 
+
+# Change outcome from 0&1 to No & Yes
+ED_data$LOS_binary <- as.factor(ED_data$LOS_binary)
+levels(ED_data$LOS_binary) <- c("No", "Yes")
+# Check 
+levels(ED_data$LOS_binary)
+# Make less than 4 hrs the reference as "Yes"
+ED_data$LOS_binary <- relevel(ED_data$LOS_binary, ref = "Yes")
+levels(ED_data$LOS_binary)
+# Check 
+prop.table(table(ED_data$LOS_binary))
+
+
+# Outcome 
+str(ED_data)
+
+
+# Remove numeric LOS column 
+ED_data <- ED_data |> 
+  select(-1)
+# Set IVs type
+ED_data$Month <- as.factor(ED_data$Month)
+ED_data$A.Day <- as.factor(ED_data$A.Day)
+ED_data$A.Hr <- as.numeric(ED_data$A.Hr) # remvoe 
+ED_data$A.shift <- as.factor(ED_data$A.shift)
+ED_data$W.FP <- as.numeric(ED_data$W.FP)# remvoe 
+ED_data$ESI <- as.factor(ED_data$ESI)
+ED_data$sex <- as.factor(ED_data$sex)
+ED_data$Age.Group <- as.factor(ED_data$Age.Group)
+ED_data$EDLevel <- as.factor(ED_data$EDLevel)
+ED_data$Pat_count <- as.numeric(ED_data$Pat_count) # remvoe 
+ED_data$D.type <- as.factor(ED_data$D.type)
+ED_data$T.arrive <- as.factor(ED_data$T.arrive)
+ED_data$PP_MD <- as.numeric(ED_data$PP_MD)
+ED_data$PP_N <- as.numeric(ED_data$PP_N)
+ED_data$PP_R <- as.numeric(ED_data$PP_R)
+ED_data$FirstWard  <- as.factor(ED_data$FirstWard)
+ED_data$W.Change  <- as.factor(ED_data$W.Change)
+#ED_data$LOS_binary <- as.factor(ED_data$LOS_binary)
+```
+
+# Set train and test data 
+```{r}
+# Partition data into training and test sets (Stratified sampling based on target variable)
+set.seed(1234)
+ind<- createDataPartition(ED_data$LOS_binary, p = 0.7, list = FALSE) 
+train<- ED_data[ind, ]
+test<- ED_data[-ind,] 
+
+# Check to see how creatDataPratition split the data equally
+prop.table(table(train$LOS_binary))
+prop.table(table(test$LOS_binary))
+
+# Change referned in train and test data 
+# train$LOS_binary <- relevel(train$LOS_binary, ref = "Yes")
+# levels(train$LOS_binary)
+# prop.table(table(train$LOS_binary))
+```
+
+
+# Define contrl 
+```{r}
+# Define control
+control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  classProbs = T,
+  summaryFunction = twoClassSummary)
+
+```
+
+# Model 1: Logistic regression 
+```{r}
+names(ED_data)
+# Logistic original 
+set.seed(1234)
+log_model <- train(LOS_binary~.-A.Hr -W.FP -Pat_count -Month -A.Day -FirstWard,
+                   data = train,
+                   method = "glm",
+                   family = "binomial",
+                   metric = "ROC",
+                   trControl = control)
+
+# train outcome
+fittedlog_model_train<- predict(log_model, train)
+confusionMatrix(reference = train$LOS_binary, data = fittedlog_model_train, mode = "everything")
+
+
+# Test outcome
+fittedlog_model_test <- pred_log <- predict(log_model, test)
+confusionMatrix(reference = test$LOS_binary, data = fittedlog_model_test, mode = "everything")
+
+# ROC 
+# Predict Probabilities on the Test Set
+fittedlog_model_test_probs <- predict(log_model, newdata = test, type = "prob")
+
+# Extract the probabilities for the positive class
+# Assuming your positive class is represented by the second column in the predicted probabilities
+positive_class_probs <- fittedlog_model_test_probs[, 2]
+
+# Calculate the ROC curve
+roc_curve <- roc(test$LOS_binary, positive_class_probs)
+
+# Plot the ROC Curve
+plot(roc_curve, main = "ROC Curve for Test Data")
+plot(roc_curve, 
+     main = "ROC Curve for Logistic Regression Model",
+     col = "blue", 
+     lwd = 2,  # line width
+     xlab = "False Positive Rate", 
+     ylab = "True Positive Rate",
+     xlim = c(0, 1), 
+     ylim = c(0, 1))
+
+# Adding a reference line
+abline(0, 1, col = "red", lty = 2) # red dashed diagonal line
+
+# Annotating the AUC (Area Under Curve)
+auc(roc_curve) -> auc_value
+legend("bottomright", 
+       legend = paste("AUC =", round(auc_value, 2)), 
+       col = "blue", 
+       lwd = 2)
+```
+
+# Model 2: Random forest
+```{r}
+# library(doParallel)
+# library(foreach)
+# registerDoParallel(cores = 4)
+# #stopImplicitCluster()
+# 
+# # Create a grid for hyperparameters
+# grid <- expand.grid(
+#   mtry = seq(from = 2, to = 100, by = 1)            # number of variables randomly sampled as candidates at each split
+#   # splitrule = c("gini", "extratrees"),
+#   # min.node.size = c(1, 5, 10),    # minimum size of terminal nodes
+#   # ntree = c(500, 1000, 1500)      # number of trees to grow
+# )
+# 
+# # Model 2: Random forest 
+# set.seed(123400)
+# rf_model <- train(LOS_binary~.-A.Hr -W.FP -Pat_count -Month,
+#                    data = train,
+#                    method = "rf",
+#                    family = "binomial",
+#                    metric = "ROC",
+#                    trControl = control,
+#                   tuneGrid = grid)
+# 
+# 
+# # train outcome
+# fitted_rf_model_train <- predict(rf_model, train)
+# confusionMatrix(reference = train$LOS_binary, data = fitted_rf_model_train, mode = "everything")
+# 
+# 
+# # Test outcome
+# fitted_rf_model_test <- predict(rf_model, test)
+# confusionMatrix(reference = test$LOS_binary, data = fitted_rf_model_test, mode = "everything")
+
+
+```
+
+
+# Model 3: Xgboost 
+```{r}
+installed.packages("xgboost")
+library(xgboost)
+# Xgboost
+set.seed(123411)
+xgboost_model <- train(LOS_binary~.-A.Hr -W.FP -Pat_count -Month -A.Day -FirstWard,
+                   data = train,
+                   method = "xgbTree",
+                   metric = "ROC",
+                   trControl = control)
+
+# train outcome
+fitted_xgboost_model_train<- predict(xgboost_model, train)
+confusionMatrix(reference = train$LOS_binary, data = fitted_xgboost_model_train, mode = "everything")
+
+
+# Test outcome
+fitted_xgboost_model_test <- pred_log <- predict(xgboost_model, test)
+confusionMatrix(reference = test$LOS_binary, data = fitted_xgboost_model_test, mode = "everything")
+
+
+library(xgboost)
+final_model <- xgboost_model$finalModel
+# Calculate feature importance
+importance_matrix <- xgb.importance(feature_names = final_model$feature_names, model = final_model)
+
+# Plot feature importance
+xgb.plot.importance(importance_matrix)
+
+plot(varImp(xgboost_model))
+
+shap.plot.summary.wrap1
+##############
+library(caret)
+library(xgboost)
+library(ggplot2)
+
+# Assuming 'xgboost_model' is already trained using the caret package...
+
+# Extract the actual xgboost model from caret object
+xgb_model <- xgboost_model$finalModel
+
+# Extract feature importance
+importance_matrix <- xgb.importance(model = xgb_model)
+
+# Convert it to a data frame for easier manipulation
+importance_df <- as.data.frame(importance_matrix)
+
+# Identify one-hot encoded features and their original variable names
+# This step assumes that the one-hot encoding creates names like 'variable.level'
+original_features <- gsub("\\.\\w+$", "", rownames(importance_df))
+
+# Aggregate the importances by original feature names
+importance_df$Feature <- original_features
+aggregated_importance <- aggregate(importance_df$Gain, by = list(importance_df$Feature), FUN = sum)
+colnames(aggregated_importance) <- c("Feature", "Importance")
+
+# Sort by importance
+aggregated_importance <- aggregated_importance[order(-aggregated_importance$Importance), ]
+
+# Plot the aggregated feature importance
+plot <- ggplot(aggregated_importance, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() + # Flip coordinates to make it horizontal
+  labs(x = "Feature", y = "Importance") +
+  theme_minimal()
+
+
+```
+
+# Model 4: NN 
+```{r}
+tuneGrid <- expand.grid(size = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+                        decay = c(0, 0.001, 0.01, 0.1))
+set.seed(1110)
+NN_model <- train(LOS_binary~.-A.Hr -W.FP -Pat_count -Month -A.Day -FirstWard,
+                   data = train,
+                   method = "nnet",
+                   metric = "ROC",
+                   trControl = control,
+                  preProcess = c("center", "scale"),
+                  tuneGrid = tuneGrid)
+
+# train outcome
+fitted_NN_model_train<- predict(NN_model, train)
+confusionMatrix(reference = train$LOS_binary, data = fitted_NN_model_train, mode = "everything")
+
+
+# Test outcome
+fitted_NN_model_test <- pred_log <- predict(NN_model, test)
+confusionMatrix(reference = test$LOS_binary, data = fitted_NN_model_test, mode = "everything")
+```
+
